@@ -145,17 +145,26 @@ class SlurmJobManagerCERN(JobManager):
         return not any(img_type in self.docker_img for img_type in [".sif", "cvmfs"])
 
     def _pull_image(self):
-        """Pull a Docker image using Singularity."""
-        if self.img_type_docker:
-            self.slurm_connection.exec_command(
-                f"cd {self.SLURM_WORKSAPCE_PATH} && singularity pull docker://{self.docker_img}"
-            )
+        """Pull a Docker image using Singularity, skip if .sif already exists."""
+        if not self.img_type_docker:
+            return
+        sif_path = self._sif_path()
+        result = self.slurm_connection.exec_command(f'test -f "{sif_path}"')
+        if result is not None:
+            return  # file exists, skip pull
+        self.slurm_connection.exec_command(
+            f"cd {self.SLURM_WORKSAPCE_PATH} && singularity pull docker://{self.docker_img}"
+        )
 
     def _get_container(self):
         """Get container image."""
         if self.img_type_docker:
             return self.docker_img.split("/")[-1].replace(":", "_") + ".sif"
         return self.docker_img
+
+    def _sif_path(self):
+        """Return the absolute path of the .sif file on the Slurm head node."""
+        return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, self._get_container())
 
     def _dump_job_submission_file(self):
         """Dump job submission file to the Slurm submit node."""
