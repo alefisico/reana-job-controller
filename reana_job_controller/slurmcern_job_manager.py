@@ -121,7 +121,8 @@ class SlurmJobManagerCERN(JobManager):
     def execute(self):
         """Execute / submit a job with Slurm."""
         self.cmd = self._encode_cmd(self.cmd)
-        initialize_krb5_token(workflow_uuid=self.workflow_uuid)
+        if not os.getenv("SLURM_SKIP_KRB5", "false").lower() == "true":
+            initialize_krb5_token(workflow_uuid=self.workflow_uuid)
         self.slurm_connection = SSHClient(
             hostname=SLURM_HEADNODE_HOSTNAME,
             port=SLURM_HEADNODE_PORT,
@@ -142,6 +143,8 @@ class SlurmJobManagerCERN(JobManager):
         return backend_job_id
 
     def _is_img_type_docker(self):
+        if not self.docker_img:
+            return False
         return not any(img_type in self.docker_img for img_type in [".sif", "cvmfs"])
 
     def _pull_image(self):
@@ -209,8 +212,10 @@ class SlurmJobManagerCERN(JobManager):
         return "echo {}|base64 -d|bash".format(encoded_cmd)
 
     def _wrap_singularity_cmd(self):
-        """Wrap command in singulrity."""
-        base_singularity_cmd = (
+        """Wrap command in Singularity, or run natively if no container image."""
+        if not self.docker_img:
+            return "./" + self.job_file
+        return (
             "singularity exec -B {SLURM_WORKSAPCE}:{REANA_WORKSPACE}"
             " {IMAGE} {CMD}".format(
                 SLURM_WORKSAPCE=SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
@@ -219,7 +224,6 @@ class SlurmJobManagerCERN(JobManager):
                 CMD="./" + self.job_file,
             )
         )
-        return base_singularity_cmd
 
     def get_outputs():
         """Transfer job outputs to REANA."""

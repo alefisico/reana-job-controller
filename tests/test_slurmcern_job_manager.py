@@ -100,3 +100,26 @@ class TestPullImage:
         mgr.slurm_connection.exec_command.reset_mock()
         mgr._pull_image()
         assert mgr.slurm_connection.exec_command.call_count == 1
+
+
+class TestNativeExecution:
+    """Tests for native (no container) execution path."""
+
+    def test_no_image_is_not_docker_type(self):
+        """None docker_img → img_type_docker is False."""
+        mgr = _make_manager(None)
+        assert mgr.img_type_docker is False
+
+    def test_pull_image_skipped_when_no_image(self):
+        """No singularity pull when docker_img is None."""
+        mgr = _make_manager(None)
+        mgr._pull_image()
+        mgr.slurm_connection.exec_command.assert_not_called()
+
+    def test_wrap_singularity_cmd_returns_native_cmd_when_no_image(self):
+        """_wrap_singularity_cmd() returns ./job.sh directly when no container."""
+        mgr = _make_manager(None)
+        mgr.job_file = "job.sh"
+        result = mgr._wrap_singularity_cmd()
+        assert result == "./job.sh"
+        assert "singularity" not in result
