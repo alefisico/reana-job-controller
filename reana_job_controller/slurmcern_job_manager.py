@@ -134,13 +134,21 @@ class SlurmJobManagerCERN(JobManager):
         self._pull_image()
         self._dump_job_file()
         self._dump_job_submission_file()
+        backend_job_id = self._execute_sbatch()
+        return backend_job_id
+
+    def _execute_sbatch(self):
+        """Submit job_description_file via sbatch and return the Slurm job ID."""
         stdout = self.slurm_connection.exec_command(
             "cd {} && sbatch --parsable {}".format(
                 SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, self.job_description_file
             )
         )
-        backend_job_id = stdout.rstrip()
-        return backend_job_id
+        if stdout is None:
+            raise RuntimeError(
+                "sbatch returned no output — SSH connection to Slurm head node failed"
+            )
+        return stdout.rstrip()
 
     def _is_img_type_docker(self):
         if not self.docker_img:

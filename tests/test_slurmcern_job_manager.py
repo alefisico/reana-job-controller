@@ -102,6 +102,45 @@ class TestPullImage:
         assert mgr.slurm_connection.exec_command.call_count == 1
 
 
+class TestSbatchFailure:
+    """Tests for sbatch SSH failure handling."""
+
+    def test_raises_on_sbatch_none_return(self):
+        """RuntimeError raised when sbatch exec_command returns None (SSH failure)."""
+        import pytest
+        from unittest.mock import patch, MagicMock
+
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
+            mgr.docker_img = "docker.io/myorg/myimage:v1.0"
+            mgr.img_type_docker = True
+            mgr.slurm_connection = MagicMock()
+            mgr.slurm_connection.exec_command.return_value = None
+            mgr.job_description_file = "job_description.sh"
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
+
+            with pytest.raises(RuntimeError, match="sbatch returned no output"):
+                mgr._execute_sbatch()
+
+    def test_returns_job_id_on_success(self):
+        """backend_job_id is stripped stdout when sbatch succeeds."""
+        from unittest.mock import patch, MagicMock
+
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
+            mgr.docker_img = "docker.io/myorg/myimage:v1.0"
+            mgr.img_type_docker = True
+            mgr.slurm_connection = MagicMock()
+            mgr.slurm_connection.exec_command.return_value = "12345\n"
+            mgr.job_description_file = "job_description.sh"
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
+
+            result = mgr._execute_sbatch()
+            assert result == "12345"
+
+
 class TestNativeExecution:
     """Tests for native (no container) execution path."""
 
