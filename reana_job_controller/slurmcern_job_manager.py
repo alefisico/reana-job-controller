@@ -9,6 +9,7 @@
 import base64
 import logging
 import os
+import re
 from stat import S_ISDIR
 
 from reana_job_controller.job_manager import JobManager
@@ -179,6 +180,7 @@ class SlurmJobManagerCERN(JobManager):
 
     def _dump_job_submission_file(self):
         """Dump job submission file to the Slurm submit node."""
+        safe_job_name = re.sub(r"[^\w\-.]", "_", self.job_name)
         job_template = (
             "#!/bin/bash \n"
             "#SBATCH --job-name={job_name} \n"
@@ -191,7 +193,7 @@ class SlurmJobManagerCERN(JobManager):
         ).format(
             partition=self.partition,
             time=self.timelimit,
-            job_name=self.job_name,
+            job_name=safe_job_name,
             command=self._wrap_singularity_cmd(),
         )
         self.slurm_connection.exec_command(

@@ -102,6 +102,55 @@ class TestPullImage:
         assert mgr.slurm_connection.exec_command.call_count == 1
 
 
+class TestJobNameSanitization:
+    """Tests for SBATCH job-name sanitization."""
+
+    def test_job_name_with_wildcards_is_sanitized(self):
+        """Parentheses, spaces, commas, = in job name are replaced with underscores."""
+        from unittest.mock import patch, MagicMock
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
+            mgr.docker_img = "/cvmfs/unpacked.cern.ch/image"
+            mgr.img_type_docker = False
+            mgr.job_name = "analysis_databkgs (sample=TTToHadronic, year=UL16_preVFP)"
+            mgr.partition = "standard"
+            mgr.timelimit = "1:00:00"
+            mgr.job_file = "job.sh"
+            mgr.job_description_file = "job_description.sh"
+            mgr.slurm_connection = MagicMock()
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
+            SlurmJobManagerCERN.REANA_WORKSPACE_PATH = "/reana/workspace"
+
+            mgr._dump_job_submission_file()
+
+            written = mgr.slurm_connection.exec_command.call_args[0][0]
+            assert "(sample=TTToHadronic, year=UL16_preVFP)" not in written
+            assert "analysis_databkgs__sample_TTToHadronic__year_UL16_preVFP_" in written
+
+    def test_plain_job_name_unchanged(self):
+        """Job names without special chars pass through unchanged."""
+        from unittest.mock import patch, MagicMock
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
+            mgr.docker_img = "/cvmfs/unpacked.cern.ch/image"
+            mgr.img_type_docker = False
+            mgr.job_name = "analysis_databkgs"
+            mgr.partition = "standard"
+            mgr.timelimit = "1:00:00"
+            mgr.job_file = "job.sh"
+            mgr.job_description_file = "job_description.sh"
+            mgr.slurm_connection = MagicMock()
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
+            SlurmJobManagerCERN.REANA_WORKSPACE_PATH = "/reana/workspace"
+
+            mgr._dump_job_submission_file()
+
+            written = mgr.slurm_connection.exec_command.call_args[0][0]
+            assert "analysis_databkgs" in written
+
+
 class TestSbatchFailure:
     """Tests for sbatch SSH failure handling."""
 
