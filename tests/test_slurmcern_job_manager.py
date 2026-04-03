@@ -300,6 +300,93 @@ class TestTransferSecrets:
         sftp.put.assert_not_called()
 
 
+def _make_voms_secrets(**extra_env):
+    """Build a UserSecrets with the full set of voms-proxy secrets."""
+    env = {"VOMSPROXY_PASS": "cGFzc3dvcmQ=", "VONAME": "cms"}
+    env.update(extra_env)
+    return _make_user_secrets(
+        file_secrets={"usercert.pem": b"cert", "userkey.pem": b"key"},
+        env_secrets=env,
+    )
+
+
+class TestVomsProxy:
+    """Tests for voms-proxy generation in the job submission script."""
+
+    def test_has_voms_secrets_true_when_all_present(self):
+        mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
+        assert mgr._has_voms_secrets() is True
+
+    def test_has_voms_secrets_false_when_missing_key(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(
+                file_secrets={"usercert.pem": b"cert"},
+                env_secrets={"VOMSPROXY_PASS": "cGFzc3dvcmQ="},
+            ),
+        )
+        assert mgr._has_voms_secrets() is False
+
+    def test_has_voms_secrets_false_when_no_secrets(self):
+        mgr = _make_manager("docker.io/org/img:v1")
+        mgr.secrets = None
+        assert mgr._has_voms_secrets() is False
+
+    def test_voms_proxy_init_cmd_contains_voms_proxy_init(self):
+        mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
+        cmd = mgr._voms_proxy_init_cmd()
+        assert "voms-proxy-init" in cmd
+        assert "--voms cms" in cmd
+        assert "usercert.pem" in cmd
+        assert "userkey.pem" in cmd
+        assert "--pwstdin" in cmd
+        assert "voms_proxy.pem" in cmd
+
+    def test_voms_proxy_init_cmd_empty_when_secrets_missing(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(file_secrets={"usercert.pem": b"cert"}),
+        )
+        assert mgr._voms_proxy_init_cmd() == ""
+
+    def test_voms_proxy_bind_mount_included_when_voms_secrets_present(self):
+        mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
+        bind = mgr._secrets_bind_mount()
+        assert "voms_proxy.pem" in bind
+        assert "/tmp/voms_proxy.pem" in bind
+
+    def test_voms_proxy_env_flag_included_in_singularity_cmd(self):
+        mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
+        cmd = mgr._wrap_singularity_cmd()
+        assert "X509_USER_PROXY=/tmp/voms_proxy.pem" in cmd
+
+    def test_voms_proxy_init_in_job_submission_script(self):
+        mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
+        mgr.job_name = "test_job"
+        mgr.partition = "standard"
+        mgr.timelimit = "1:00:00"
+        mgr.job_description_file = "job_description.sh"
+        mgr.__class__.REANA_WORKSPACE_PATH = "/reana/workspace"
+        mgr._dump_job_submission_file()
+        written = mgr.slurm_connection.exec_command.call_args[0][0]
+        assert "voms-proxy-init" in written
+        assert "X509_USER_PROXY" in written
+
+    def test_no_voms_proxy_when_secrets_absent(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(env_secrets={"OTHER_VAR": "val"}),
+        )
+        mgr.job_name = "test_job"
+        mgr.partition = "standard"
+        mgr.timelimit = "1:00:00"
+        mgr.job_description_file = "job_description.sh"
+        mgr.__class__.REANA_WORKSPACE_PATH = "/reana/workspace"
+        mgr._dump_job_submission_file()
+        written = mgr.slurm_connection.exec_command.call_args[0][0]
+        assert "voms-proxy-init" not in written
+
+
 class TestNativeExecution:
     """Tests for native (no container) execution path."""
 

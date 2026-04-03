@@ -207,6 +207,44 @@ class SlurmJobManagerCERN(JobManager):
         """Return the absolute path of the .sif file on the Slurm head node."""
         return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, self._get_container())
 
+    def _has_voms_secrets(self):
+        """Return True if all required voms-proxy secrets are present."""
+        if not self.secrets:
+            return False
+        names = {s.name for s in self.secrets.get_secrets()}
+        return {"usercert.pem", "userkey.pem", "VOMSPROXY_PASS"}.issubset(names)
+
+    def _voms_proxy_path(self):
+        """Return the host-side path where the voms proxy will be written."""
+        return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "voms_proxy.pem")
+
+    def _voms_proxy_init_cmd(self):
+        """Return bash snippet that generates a voms proxy on the Slurm worker."""
+        if not self._has_voms_secrets():
+            return ""
+        secrets_dir = os.path.join(
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
+        )
+        voname = ""
+        if self.secrets:
+            voname_secret = self.secrets.get_secret("VONAME")
+            if voname_secret:
+                voname = voname_secret.value_str.strip().lower()
+        return (
+            "cp {secrets_dir}/userkey.pem /tmp/userkey.pem\n"
+            "chmod 400 /tmp/userkey.pem\n"
+            "echo $VOMSPROXY_PASS | base64 -d | voms-proxy-init"
+            " --voms {voname}"
+            " --key /tmp/userkey.pem"
+            " --cert {secrets_dir}/usercert.pem"
+            " --pwstdin"
+            " --out {proxy_path}\n"
+        ).format(
+            secrets_dir=secrets_dir,
+            voname=voname,
+            proxy_path=self._voms_proxy_path(),
+        )
+
     def _env_secrets_exports(self):
         """Return export statements for env-type secrets."""
         if not self.secrets:
@@ -231,12 +269,14 @@ class SlurmJobManagerCERN(JobManager):
             "#SBATCH --time {time} \n"
             "export PATH=$PATH:/usr/sbin \n"
             "{env_secrets}"
+            "{voms_proxy_init}"
             "srun {command}"
         ).format(
             partition=self.partition,
             time=self.timelimit,
             job_name=safe_job_name,
             env_secrets=self._env_secrets_exports(),
+            voms_proxy_init=self._voms_proxy_init_cmd(),
             command=self._wrap_singularity_cmd(),
         )
         self.slurm_connection.exec_command(
@@ -265,7 +305,7 @@ class SlurmJobManagerCERN(JobManager):
         return "echo {}|base64 -d|bash".format(encoded_cmd)
 
     def _secrets_bind_mount(self):
-        """Return Singularity -B flag for secrets if file secrets exist."""
+        """Return Singularity -B flags for secrets and voms proxy if present."""
         if not self.secrets:
             return ""
         file_secrets = [s for s in self.secrets.get_secrets() if s.type_ == "file"]
@@ -274,7 +314,16 @@ class SlurmJobManagerCERN(JobManager):
         secrets_remote_dir = os.path.join(
             SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
         )
-        return " -B {}:{}:ro".format(secrets_remote_dir, REANA_USER_SECRET_MOUNT_PATH)
+        bind = " -B {}:{}:ro".format(secrets_remote_dir, REANA_USER_SECRET_MOUNT_PATH)
+        if self._has_voms_secrets():
+            bind += " -B {}:/tmp/voms_proxy.pem".format(self._voms_proxy_path())
+        return bind
+
+    def _voms_proxy_env(self):
+        """Return --env flag setting X509_USER_PROXY inside Singularity."""
+        if not self._has_voms_secrets():
+            return ""
+        return " --env X509_USER_PROXY=/tmp/voms_proxy.pem"
 
     def _wrap_singularity_cmd(self):
         """Wrap command in Singularity, or run natively if no container image."""
@@ -283,10 +332,12 @@ class SlurmJobManagerCERN(JobManager):
         return (
             "singularity exec -B {SLURM_WORKSAPCE}:{REANA_WORKSPACE}"
             "{SECRETS_BIND}"
+            "{VOMS_PROXY_ENV}"
             " {IMAGE} {CMD}".format(
                 SLURM_WORKSAPCE=SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
                 REANA_WORKSPACE=SlurmJobManagerCERN.REANA_WORKSPACE_PATH,
                 SECRETS_BIND=self._secrets_bind_mount(),
+                VOMS_PROXY_ENV=self._voms_proxy_env(),
                 IMAGE=self._get_container(),
                 CMD="./" + self.job_file,
             )
