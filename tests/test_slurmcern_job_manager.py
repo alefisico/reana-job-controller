@@ -107,48 +107,38 @@ class TestJobNameSanitization:
 
     def test_job_name_with_wildcards_is_sanitized(self):
         """Parentheses, spaces, commas, = in job name are replaced with underscores."""
-        from unittest.mock import patch, MagicMock
-        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
-            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
-            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
-            mgr.docker_img = "/cvmfs/unpacked.cern.ch/image"
-            mgr.img_type_docker = False
-            mgr.job_name = "analysis_databkgs (sample=TTToHadronic, year=UL16_preVFP)"
-            mgr.partition = "standard"
-            mgr.timelimit = "1:00:00"
-            mgr.job_file = "job.sh"
-            mgr.job_description_file = "job_description.sh"
-            mgr.slurm_connection = MagicMock()
-            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
-            SlurmJobManagerCERN.REANA_WORKSPACE_PATH = "/reana/workspace"
+        mgr = _make_manager("/cvmfs/unpacked.cern.ch/image")
+        mgr.img_type_docker = False
+        mgr.job_name = "analysis_databkgs (sample=TTToHadronic, year=UL16_preVFP)"
+        mgr.partition = "standard"
+        mgr.timelimit = "1:00:00"
+        mgr.job_file = "job.sh"
+        mgr.job_description_file = "job_description.sh"
+        mgr.secrets = None
+        mgr.__class__.REANA_WORKSPACE_PATH = "/reana/workspace"
 
-            mgr._dump_job_submission_file()
+        mgr._dump_job_submission_file()
 
-            written = mgr.slurm_connection.exec_command.call_args[0][0]
-            assert "(sample=TTToHadronic, year=UL16_preVFP)" not in written
-            assert "analysis_databkgs__sample_TTToHadronic__year_UL16_preVFP_" in written
+        written = mgr.slurm_connection.exec_command.call_args[0][0]
+        assert "(sample=TTToHadronic, year=UL16_preVFP)" not in written
+        assert "analysis_databkgs__sample_TTToHadronic__year_UL16_preVFP_" in written
 
     def test_plain_job_name_unchanged(self):
         """Job names without special chars pass through unchanged."""
-        from unittest.mock import patch, MagicMock
-        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
-            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
-            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
-            mgr.docker_img = "/cvmfs/unpacked.cern.ch/image"
-            mgr.img_type_docker = False
-            mgr.job_name = "analysis_databkgs"
-            mgr.partition = "standard"
-            mgr.timelimit = "1:00:00"
-            mgr.job_file = "job.sh"
-            mgr.job_description_file = "job_description.sh"
-            mgr.slurm_connection = MagicMock()
-            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
-            SlurmJobManagerCERN.REANA_WORKSPACE_PATH = "/reana/workspace"
+        mgr = _make_manager("/cvmfs/unpacked.cern.ch/image")
+        mgr.img_type_docker = False
+        mgr.job_name = "analysis_databkgs"
+        mgr.partition = "standard"
+        mgr.timelimit = "1:00:00"
+        mgr.job_file = "job.sh"
+        mgr.job_description_file = "job_description.sh"
+        mgr.secrets = None
+        mgr.__class__.REANA_WORKSPACE_PATH = "/reana/workspace"
 
-            mgr._dump_job_submission_file()
+        mgr._dump_job_submission_file()
 
-            written = mgr.slurm_connection.exec_command.call_args[0][0]
-            assert "analysis_databkgs" in written
+        written = mgr.slurm_connection.exec_command.call_args[0][0]
+        assert "analysis_databkgs" in written
 
 
 class TestSbatchFailure:
@@ -188,6 +178,126 @@ class TestSbatchFailure:
 
             result = mgr._execute_sbatch()
             assert result == "12345"
+
+
+def _make_manager_with_secrets(docker_img, secrets):
+    """Instantiate SlurmJobManagerCERN with secrets set."""
+    mgr = _make_manager(docker_img)
+    mgr.secrets = secrets
+    SlurmJobManagerCERN = mgr.__class__
+    SlurmJobManagerCERN.REANA_WORKSPACE_PATH = "/reana/workspace"
+    mgr.job_file = "job.sh"
+    return mgr
+
+
+def _make_user_secrets(file_secrets=None, env_secrets=None):
+    """Build a UserSecrets object with given file and env secrets."""
+    from reana_commons.k8s.secrets import UserSecrets, Secret
+    secrets_list = []
+    for name, value in (file_secrets or {}).items():
+        secrets_list.append(Secret(name, "file", value))
+    for name, value in (env_secrets or {}).items():
+        secrets_list.append(Secret(name, "env", value))
+    return UserSecrets(user_id="test-user", k8s_secret_name="test-secret", secrets=secrets_list)
+
+
+class TestSecretsBindMount:
+    """Tests for _secrets_bind_mount."""
+
+    def test_no_secrets_returns_empty(self):
+        mgr = _make_manager("docker.io/org/img:v1")
+        mgr.secrets = None
+        mgr.job_file = "job.sh"
+        from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+        SlurmJobManagerCERN.REANA_WORKSPACE_PATH = "/reana/workspace"
+        assert mgr._secrets_bind_mount() == ""
+
+    def test_env_only_secrets_returns_empty(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(env_secrets={"MY_VAR": "value"}),
+        )
+        assert mgr._secrets_bind_mount() == ""
+
+    def test_file_secrets_returns_bind_flag(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(file_secrets={"usercert.pem": b"cert-data"}),
+        )
+        result = mgr._secrets_bind_mount()
+        assert result.startswith(" -B ")
+        assert "reana_secrets" in result
+        assert "/etc/reana/secrets" in result
+        assert ":ro" in result
+
+
+class TestEnvSecretsExports:
+    """Tests for _env_secrets_exports."""
+
+    def test_no_secrets_returns_empty(self):
+        mgr = _make_manager("docker.io/org/img:v1")
+        mgr.secrets = None
+        assert mgr._env_secrets_exports() == ""
+
+    def test_file_only_secrets_returns_empty(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(file_secrets={"cert.pem": b"data"}),
+        )
+        assert mgr._env_secrets_exports() == ""
+
+    def test_env_secrets_produce_export_lines(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(env_secrets={"VOMSPROXY_PASS": "mypassword"}),
+        )
+        result = mgr._env_secrets_exports()
+        assert "export VOMSPROXY_PASS=mypassword" in result
+
+    def test_multiple_env_secrets(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(env_secrets={"VAR_A": "aaa", "VAR_B": "bbb"}),
+        )
+        result = mgr._env_secrets_exports()
+        assert "export VAR_A=aaa" in result
+        assert "export VAR_B=bbb" in result
+
+
+class TestTransferSecrets:
+    """Tests for _transfer_secrets."""
+
+    def test_no_secrets_does_nothing(self):
+        mgr = _make_manager("docker.io/org/img:v1")
+        mgr.secrets = None
+        sftp = MagicMock()
+        mgr._transfer_secrets(sftp)
+        sftp.mkdir.assert_not_called()
+        sftp.put.assert_not_called()
+
+    def test_file_secrets_are_transferred(self):
+        import tempfile, os
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(file_secrets={"usercert.pem": b"cert", "userkey.pem": b"key"}),
+        )
+        sftp = MagicMock()
+        mgr._transfer_secrets(sftp)
+        sftp.mkdir.assert_called_once()
+        assert sftp.put.call_count == 2
+        transferred_names = {
+            os.path.basename(call.args[1]) for call in sftp.put.call_args_list
+        }
+        assert transferred_names == {"usercert.pem", "userkey.pem"}
+
+    def test_env_secrets_are_not_transferred(self):
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(env_secrets={"MY_VAR": "value"}),
+        )
+        sftp = MagicMock()
+        mgr._transfer_secrets(sftp)
+        sftp.put.assert_not_called()
 
 
 class TestNativeExecution:

@@ -10,8 +10,11 @@ import base64
 import logging
 import os
 import re
+import tempfile
 from stat import S_ISDIR
 
+from reana_commons.config import REANA_USER_SECRET_MOUNT_PATH
+from reana_commons.k8s.secrets import UserSecrets
 from reana_job_controller.job_manager import JobManager
 from reana_job_controller.utils import SSHClient, initialize_krb5_token
 from reana_job_controller.config import (
@@ -48,6 +51,7 @@ class SlurmJobManagerCERN(JobManager):
         job_name=None,
         slurm_partition=SLURM_PARTITION,
         slurm_job_timelimit=SLURM_JOB_TIMELIMIT,
+        secrets: UserSecrets = None,
         **kwargs,
     ):
         """Instanciate Slurm job manager.
@@ -74,6 +78,8 @@ class SlurmJobManagerCERN(JobManager):
         :type slurm_partition: str
         :param slurm_job_timelimit: Maximum timelimit of a Slurm job.
         :type slurm_job_timelimit: str
+        :param secrets: User secrets (file and env types).
+        :type secrets: UserSecrets
         """
         super(SlurmJobManagerCERN, self).__init__(
             docker_img=docker_img,
@@ -91,6 +97,7 @@ class SlurmJobManagerCERN(JobManager):
         self.job_description_file = "job_description.sh"
         self.partition = slurm_partition
         self.timelimit = slurm_job_timelimit
+        self.secrets = secrets
         self.img_type_docker = self._is_img_type_docker()
 
     def _transfer_inputs(self):
@@ -116,7 +123,29 @@ class SlurmJobManagerCERN(JobManager):
                     os.path.join(dirpath, file),
                     os.path.join(self.slurm_home_path, dirpath[1:], file),
                 )
+        self._transfer_secrets(sftp)
         sftp.close()
+
+    def _transfer_secrets(self, sftp):
+        """Transfer file-type user secrets to Slurm head node."""
+        if not self.secrets:
+            return
+        file_secrets = [s for s in self.secrets.get_secrets() if s.type_ == "file"]
+        if not file_secrets:
+            return
+        secrets_remote_dir = os.path.join(
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
+        )
+        try:
+            sftp.mkdir(secrets_remote_dir)
+        except Exception:
+            pass
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for secret in file_secrets:
+                local_path = os.path.join(tmpdir, secret.name)
+                with open(local_path, "wb") as f:
+                    f.write(secret.value_bytes)
+                sftp.put(local_path, os.path.join(secrets_remote_dir, secret.name))
 
     @JobManager.execution_hook
     def execute(self):
@@ -178,6 +207,18 @@ class SlurmJobManagerCERN(JobManager):
         """Return the absolute path of the .sif file on the Slurm head node."""
         return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, self._get_container())
 
+    def _env_secrets_exports(self):
+        """Return export statements for env-type secrets."""
+        if not self.secrets:
+            return ""
+        exports = []
+        for secret in self.secrets.get_secrets():
+            if secret.type_ == "env":
+                exports.append(
+                    "export {}={}\n".format(secret.name, secret.value_str)
+                )
+        return "".join(exports)
+
     def _dump_job_submission_file(self):
         """Dump job submission file to the Slurm submit node."""
         safe_job_name = re.sub(r"[^\w\-.]", "_", self.job_name)
@@ -189,11 +230,13 @@ class SlurmJobManagerCERN(JobManager):
             "#SBATCH --partition {partition} \n"
             "#SBATCH --time {time} \n"
             "export PATH=$PATH:/usr/sbin \n"
+            "{env_secrets}"
             "srun {command}"
         ).format(
             partition=self.partition,
             time=self.timelimit,
             job_name=safe_job_name,
+            env_secrets=self._env_secrets_exports(),
             command=self._wrap_singularity_cmd(),
         )
         self.slurm_connection.exec_command(
@@ -221,15 +264,29 @@ class SlurmJobManagerCERN(JobManager):
         encoded_cmd = base64.b64encode(cmd.encode("utf-8")).decode("utf-8")
         return "echo {}|base64 -d|bash".format(encoded_cmd)
 
+    def _secrets_bind_mount(self):
+        """Return Singularity -B flag for secrets if file secrets exist."""
+        if not self.secrets:
+            return ""
+        file_secrets = [s for s in self.secrets.get_secrets() if s.type_ == "file"]
+        if not file_secrets:
+            return ""
+        secrets_remote_dir = os.path.join(
+            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
+        )
+        return " -B {}:{}:ro".format(secrets_remote_dir, REANA_USER_SECRET_MOUNT_PATH)
+
     def _wrap_singularity_cmd(self):
         """Wrap command in Singularity, or run natively if no container image."""
         if not self.docker_img:
             return "./" + self.job_file
         return (
             "singularity exec -B {SLURM_WORKSAPCE}:{REANA_WORKSPACE}"
+            "{SECRETS_BIND}"
             " {IMAGE} {CMD}".format(
                 SLURM_WORKSAPCE=SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
                 REANA_WORKSPACE=SlurmJobManagerCERN.REANA_WORKSPACE_PATH,
+                SECRETS_BIND=self._secrets_bind_mount(),
                 IMAGE=self._get_container(),
                 CMD="./" + self.job_file,
             )

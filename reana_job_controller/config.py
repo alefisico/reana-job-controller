@@ -228,6 +228,10 @@ SLURM_SSH_BANNER_TIMEOUT = float(os.getenv("SLURM_SSH_BANNER_TIMEOUT", "60"))
 SLURM_SSH_AUTH_TIMEOUT = float(os.getenv("SLURM_SSH_AUTH_TIMEOUT", "60"))
 """Seconds to wait for SLURM SSH authentication response."""
 
+SLURM_SKIP_KRB5 = os.getenv("SLURM_SKIP_KRB5", "false").lower() == "true"
+"""If true, skip Kerberos token initialization before Slurm job submission.
+Use this when authenticating via SSH key instead of Kerberos (e.g. non-CERN deployments)."""
+
 USE_KUEUE = bool(strtobool(os.getenv("USE_KUEUE", "False")))
 """Whether to use Kueue to manage job execution."""
 
