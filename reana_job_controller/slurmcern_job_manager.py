@@ -236,12 +236,13 @@ class SlurmJobManagerCERN(JobManager):
             voname_secret = self.secrets.get_secret("VONAME")
             if voname_secret:
                 voname = voname_secret.value_str.strip().lower()
+        userkey_tmp = os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "userkey.pem")
         return (
-            "cp {secrets_dir}/userkey.pem /tmp/userkey.pem\n"
-            "chmod 400 /tmp/userkey.pem\n"
+            "cp {secrets_dir}/userkey.pem {userkey_tmp}\n"
+            "chmod 400 {userkey_tmp}\n"
             "echo $VOMSPROXY_PASS | base64 -d | voms-proxy-init"
             " --voms {voname}"
-            " --key /tmp/userkey.pem"
+            " --key {userkey_tmp}"
             " --cert {secrets_dir}/usercert.pem"
             " --pwstdin"
             " --out {proxy_path}\n"
@@ -251,6 +252,7 @@ class SlurmJobManagerCERN(JobManager):
             "fi\n"
         ).format(
             secrets_dir=secrets_dir,
+            userkey_tmp=userkey_tmp,
             voname=voname,
             proxy_path=self._voms_proxy_path(),
         )

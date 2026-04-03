@@ -341,6 +341,7 @@ class TestVomsProxy:
         assert "userkey.pem" in cmd
         assert "--pwstdin" in cmd
         assert "voms_proxy.pem" in cmd
+        assert "/tmp/userkey.pem" not in cmd  # key copied to workspace, not /tmp
 
     def test_voms_proxy_init_cmd_empty_when_secrets_missing(self):
         mgr = _make_manager_with_secrets(
