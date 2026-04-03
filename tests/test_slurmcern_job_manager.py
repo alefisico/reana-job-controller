@@ -349,15 +349,36 @@ class TestVomsProxy:
         )
         assert mgr._voms_proxy_init_cmd() == ""
 
-    def test_voms_proxy_bind_mount_included_when_voms_secrets_present(self):
+    def test_voms_proxy_bind_not_in_secrets_bind_mount(self):
+        """Proxy bind is now a shell variable, not hardcoded in _secrets_bind_mount."""
         mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
         bind = mgr._secrets_bind_mount()
-        assert "voms_proxy.pem" in bind
-        assert "/tmp/voms_proxy.pem" in bind
+        assert "voms_proxy.pem" not in bind
 
-    def test_voms_proxy_env_flag_included_in_singularity_cmd(self):
+    def test_voms_proxy_shell_vars_in_singularity_cmd(self):
+        """Singularity cmd uses shell variables for proxy bind/env, not literal paths."""
         mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
         cmd = mgr._wrap_singularity_cmd()
+        assert "$REANA_VOMS_PROXY_BIND" in cmd
+        assert "$REANA_VOMS_PROXY_ENV" in cmd
+
+    def test_voms_proxy_shell_vars_absent_without_voms_secrets(self):
+        """Shell variable placeholders not added when voms secrets are absent."""
+        mgr = _make_manager_with_secrets(
+            "docker.io/org/img:v1",
+            _make_user_secrets(env_secrets={"OTHER_VAR": "val"}),
+        )
+        cmd = mgr._wrap_singularity_cmd()
+        assert "$REANA_VOMS_PROXY_BIND" not in cmd
+        assert "$REANA_VOMS_PROXY_ENV" not in cmd
+
+    def test_voms_proxy_init_cmd_sets_shell_vars_conditionally(self):
+        """_voms_proxy_init_cmd sets shell vars only if proxy file was created."""
+        mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
+        cmd = mgr._voms_proxy_init_cmd()
+        assert "if [ -f" in cmd
+        assert "REANA_VOMS_PROXY_BIND" in cmd
+        assert "REANA_VOMS_PROXY_ENV" in cmd
         assert "X509_USER_PROXY=/tmp/voms_proxy.pem" in cmd
 
     def test_voms_proxy_init_in_job_submission_script(self):
@@ -370,7 +391,8 @@ class TestVomsProxy:
         mgr._dump_job_submission_file()
         written = mgr.slurm_connection.exec_command.call_args[0][0]
         assert "voms-proxy-init" in written
-        assert "X509_USER_PROXY" in written
+        assert "REANA_VOMS_PROXY_BIND" in written
+        assert "if [ -f" in written
 
     def test_no_voms_proxy_when_secrets_absent(self):
         mgr = _make_manager_with_secrets(

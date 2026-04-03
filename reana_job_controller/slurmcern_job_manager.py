@@ -219,7 +219,13 @@ class SlurmJobManagerCERN(JobManager):
         return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "voms_proxy.pem")
 
     def _voms_proxy_init_cmd(self):
-        """Return bash snippet that generates a voms proxy on the Slurm worker."""
+        """Return bash snippet that generates a voms proxy on the Slurm worker.
+
+        Sets REANA_VOMS_PROXY_BIND and REANA_VOMS_PROXY_ENV shell variables
+        that are used by _wrap_singularity_cmd() only when the proxy file was
+        successfully created — so a failed voms-proxy-init degrades gracefully
+        instead of crashing the Singularity mount.
+        """
         if not self._has_voms_secrets():
             return ""
         secrets_dir = os.path.join(
@@ -239,6 +245,10 @@ class SlurmJobManagerCERN(JobManager):
             " --cert {secrets_dir}/usercert.pem"
             " --pwstdin"
             " --out {proxy_path}\n"
+            "if [ -f {proxy_path} ]; then\n"
+            "  REANA_VOMS_PROXY_BIND=-B\\ {proxy_path}:/tmp/voms_proxy.pem\n"
+            "  REANA_VOMS_PROXY_ENV=--env\\ X509_USER_PROXY=/tmp/voms_proxy.pem\n"
+            "fi\n"
         ).format(
             secrets_dir=secrets_dir,
             voname=voname,
@@ -305,7 +315,7 @@ class SlurmJobManagerCERN(JobManager):
         return "echo {}|base64 -d|bash".format(encoded_cmd)
 
     def _secrets_bind_mount(self):
-        """Return Singularity -B flags for secrets and voms proxy if present."""
+        """Return Singularity -B flag for the secrets directory if file secrets exist."""
         if not self.secrets:
             return ""
         file_secrets = [s for s in self.secrets.get_secrets() if s.type_ == "file"]
@@ -314,30 +324,27 @@ class SlurmJobManagerCERN(JobManager):
         secrets_remote_dir = os.path.join(
             SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
         )
-        bind = " -B {}:{}:ro".format(secrets_remote_dir, REANA_USER_SECRET_MOUNT_PATH)
-        if self._has_voms_secrets():
-            bind += " -B {}:/tmp/voms_proxy.pem".format(self._voms_proxy_path())
-        return bind
-
-    def _voms_proxy_env(self):
-        """Return --env flag setting X509_USER_PROXY inside Singularity."""
-        if not self._has_voms_secrets():
-            return ""
-        return " --env X509_USER_PROXY=/tmp/voms_proxy.pem"
+        return " -B {}:{}:ro".format(secrets_remote_dir, REANA_USER_SECRET_MOUNT_PATH)
 
     def _wrap_singularity_cmd(self):
-        """Wrap command in Singularity, or run natively if no container image."""
+        """Wrap command in Singularity, or run natively if no container image.
+
+        When voms secrets are present, $REANA_VOMS_PROXY_BIND and
+        $REANA_VOMS_PROXY_ENV shell variables are expanded at runtime —
+        set by _voms_proxy_init_cmd() only if voms-proxy-init succeeded.
+        """
         if not self.docker_img:
             return "./" + self.job_file
+        voms_args = " $REANA_VOMS_PROXY_BIND $REANA_VOMS_PROXY_ENV" if self._has_voms_secrets() else ""
         return (
             "singularity exec -B {SLURM_WORKSAPCE}:{REANA_WORKSPACE}"
             "{SECRETS_BIND}"
-            "{VOMS_PROXY_ENV}"
+            "{VOMS_ARGS}"
             " {IMAGE} {CMD}".format(
                 SLURM_WORKSAPCE=SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
                 REANA_WORKSPACE=SlurmJobManagerCERN.REANA_WORKSPACE_PATH,
                 SECRETS_BIND=self._secrets_bind_mount(),
-                VOMS_PROXY_ENV=self._voms_proxy_env(),
+                VOMS_ARGS=voms_args,
                 IMAGE=self._get_container(),
                 CMD="./" + self.job_file,
             )
