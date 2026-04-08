@@ -70,7 +70,7 @@ JOB_MONITORS = {
 """Classes responsible for monitoring specific backend jobs"""
 
 
-DEFAULT_COMPUTE_BACKEND = "kubernetes"
+DEFAULT_COMPUTE_BACKEND = os.getenv("REANA_DEFAULT_COMPUTE_BACKEND", "kubernetes")
 """Default job compute backend."""
 
 SUPPORTED_COMPUTE_BACKENDS = os.getenv(
