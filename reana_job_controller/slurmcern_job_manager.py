@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from stat import S_ISDIR
 
 from reana_commons.config import REANA_USER_SECRET_MOUNT_PATH
@@ -31,10 +32,6 @@ from reana_job_controller.config import (
 class SlurmJobManagerCERN(JobManager):
     """Slurm job management."""
 
-    SLURM_WORKSAPCE_PATH = ""
-    """Absolute path inside slurm head node used for submission."""
-    REANA_WORKSPACE_PATH = ""
-    """Absolute REANA workspace path."""
     SLURM_HOME_PATH = os.getenv("SLURM_HOME_PATH", "")
     """Default SLURM home path."""
 
@@ -93,23 +90,29 @@ class SlurmJobManagerCERN(JobManager):
         self.workflow_workspace = workflow_workspace
         self.cvmfs_mounts = cvmfs_mounts
         self.shared_file_system = shared_file_system
-        self.job_file = "job.sh"
-        self.job_description_file = "job_description.sh"
         self.partition = slurm_partition
         self.timelimit = slurm_job_timelimit
         self.secrets = secrets
         self.img_type_docker = self._is_img_type_docker()
+        self.slurm_workspace_path = ""
+        self.reana_workspace_path = ""
+        self.slurm_home_path = ""
+        # Use a unique suffix per job instance to avoid file collisions
+        # when multiple jobs from the same workflow run concurrently.
+        job_suffix = str(uuid.uuid4())[:8]
+        self.job_file = "job_{}.sh".format(job_suffix)
+        self.job_description_file = "job_description_{}.sh".format(job_suffix)
 
     def _transfer_inputs(self):
         """Transfer inputs to SLURM submit node."""
         stdout = self.slurm_connection.exec_command("pwd")
         self.slurm_home_path = SlurmJobManagerCERN.SLURM_HOME_PATH or stdout.rstrip()
-        SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = os.path.join(
+        self.slurm_workspace_path = os.path.join(
             self.slurm_home_path, self.workflow_workspace[1:]
         )
-        SlurmJobManagerCERN.REANA_WORKSPACE_PATH = self.workflow_workspace
+        self.reana_workspace_path = self.workflow_workspace
         self.slurm_connection.exec_command(
-            "mkdir -p {}".format(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH)
+            "mkdir -p {}".format(self.slurm_workspace_path)
         )
         sftp = self.slurm_connection.ssh_client.open_sftp()
         os.chdir(self.workflow_workspace)
@@ -119,10 +122,12 @@ class SlurmJobManagerCERN(JobManager):
             except Exception:
                 pass
             for file in filenames:
-                sftp.put(
-                    os.path.join(dirpath, file),
-                    os.path.join(self.slurm_home_path, dirpath[1:], file),
-                )
+                remote_path = os.path.join(self.slurm_home_path, dirpath[1:], file)
+                try:
+                    sftp.chmod(remote_path, 0o664)
+                except IOError:
+                    pass  # file doesn't exist yet, chmod not needed
+                sftp.put(os.path.join(dirpath, file), remote_path)
         self._transfer_secrets(sftp)
         sftp.close()
 
@@ -134,7 +139,7 @@ class SlurmJobManagerCERN(JobManager):
         if not file_secrets:
             return
         secrets_remote_dir = os.path.join(
-            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
+            self.slurm_workspace_path, "reana_secrets"
         )
         try:
             sftp.mkdir(secrets_remote_dir)
@@ -171,7 +176,7 @@ class SlurmJobManagerCERN(JobManager):
         """Submit job_description_file via sbatch and return the Slurm job ID."""
         stdout = self.slurm_connection.exec_command(
             "cd {} && sbatch --parsable {}".format(
-                SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, self.job_description_file
+                self.slurm_workspace_path, self.job_description_file
             )
         )
         if stdout is None:
@@ -194,7 +199,7 @@ class SlurmJobManagerCERN(JobManager):
         if result is not None:
             return  # file exists, skip pull
         self.slurm_connection.exec_command(
-            f"cd {self.SLURM_WORKSAPCE_PATH} && singularity pull docker://{self.docker_img}"
+            f"cd {self.slurm_workspace_path} && singularity pull docker://{self.docker_img}"
         )
 
     def _get_container(self):
@@ -205,7 +210,7 @@ class SlurmJobManagerCERN(JobManager):
 
     def _sif_path(self):
         """Return the absolute path of the .sif file on the Slurm head node."""
-        return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, self._get_container())
+        return os.path.join(self.slurm_workspace_path, self._get_container())
 
     def _has_voms_secrets(self):
         """Return True if all required voms-proxy secrets are present."""
@@ -215,8 +220,15 @@ class SlurmJobManagerCERN(JobManager):
         return {"usercert.pem", "userkey.pem", "VOMSPROXY_PASS"}.issubset(names)
 
     def _voms_proxy_path(self):
-        """Return the host-side path where the voms proxy will be written."""
-        return os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "voms_proxy.pem")
+        """Return the host-side path where the voms proxy will be written.
+
+        Uses job_file stem as a unique suffix so concurrent jobs in the same
+        workflow don't clobber each other's proxy files.
+        """
+        suffix = self.job_file.replace("job_", "").replace(".sh", "")
+        return os.path.join(
+            self.slurm_workspace_path, "voms_proxy_{}.pem".format(suffix)
+        )
 
     def _voms_proxy_init_cmd(self):
         """Return bash snippet that generates a voms proxy on the Slurm worker.
@@ -229,14 +241,17 @@ class SlurmJobManagerCERN(JobManager):
         if not self._has_voms_secrets():
             return ""
         secrets_dir = os.path.join(
-            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
+            self.slurm_workspace_path, "reana_secrets"
         )
         voname = ""
         if self.secrets:
             voname_secret = self.secrets.get_secret("VONAME")
             if voname_secret:
                 voname = voname_secret.value_str.strip().lower()
-        userkey_tmp = os.path.join(SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "userkey.pem")
+        suffix = self.job_file.replace("job_", "").replace(".sh", "")
+        userkey_tmp = os.path.join(
+            self.slurm_workspace_path, "userkey_{}.pem".format(suffix)
+        )
         return (
             "cp {secrets_dir}/userkey.pem {userkey_tmp}\n"
             "chmod 400 {userkey_tmp}\n"
@@ -246,6 +261,7 @@ class SlurmJobManagerCERN(JobManager):
             " --cert {secrets_dir}/usercert.pem"
             " --pwstdin"
             " --out {proxy_path}\n"
+            "rm -f {userkey_tmp}\n"
             "if [ -f {proxy_path} ]; then\n"
             "  REANA_VOMS_PROXY_BIND=-B\\ {proxy_path}:/tmp/voms_proxy.pem\n"
             "  REANA_VOMS_PROXY_ENV=--env\\ X509_USER_PROXY=/tmp/voms_proxy.pem\n"
@@ -293,7 +309,7 @@ class SlurmJobManagerCERN(JobManager):
         )
         self.slurm_connection.exec_command(
             'cd {} && job="{}" && echo "$job"> {}'.format(
-                SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
+                self.slurm_workspace_path,
                 job_template,
                 self.job_description_file,
             )
@@ -304,7 +320,7 @@ class SlurmJobManagerCERN(JobManager):
         job_template = "#!/bin/bash \n{}".format(self.cmd)
         self.slurm_connection.exec_command(
             'cd {} && job="{}" && echo "$job" > {} && chmod +x {}'.format(
-                SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
+                self.slurm_workspace_path,
                 job_template,
                 self.job_file,
                 self.job_file,
@@ -324,9 +340,28 @@ class SlurmJobManagerCERN(JobManager):
         if not file_secrets:
             return ""
         secrets_remote_dir = os.path.join(
-            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH, "reana_secrets"
+            self.slurm_workspace_path, "reana_secrets"
         )
         return " -B {}:{}:ro".format(secrets_remote_dir, REANA_USER_SECRET_MOUNT_PATH)
+
+    def _cvmfs_bind_mounts(self):
+        """Return Singularity -B flags for CVMFS repositories.
+
+        Parses self.cvmfs_mounts (a stringified list of repo names, e.g.
+        "['atlas.cern.ch', 'sft.cern.ch']") and returns a bind-mount flag
+        for each repository path under /cvmfs.  Falls back to binding the
+        entire /cvmfs tree when the value cannot be parsed as a list.
+        Returns an empty string when CVMFS mounting is disabled ("false" or "").
+        """
+        import ast
+
+        if not self.cvmfs_mounts or self.cvmfs_mounts == "false":
+            return ""
+        try:
+            repos = ast.literal_eval(self.cvmfs_mounts)
+            return "".join(" -B /cvmfs/{}".format(r) for r in repos)
+        except (ValueError, SyntaxError):
+            return " -B /cvmfs"
 
     def _wrap_singularity_cmd(self):
         """Wrap command in Singularity, or run natively if no container image.
@@ -337,32 +372,35 @@ class SlurmJobManagerCERN(JobManager):
         """
         if not self.docker_img:
             return "./" + self.job_file
-        voms_args = " $REANA_VOMS_PROXY_BIND $REANA_VOMS_PROXY_ENV" if self._has_voms_secrets() else ""
+        # Use \$ so the dollar signs survive the double-quoted bash assignment used
+        # to write job_description.sh (exec_command wraps the script in job="...").
+        # Bash interprets \$ as a literal $ in double-quoted strings, so these
+        # expand correctly at job-run time after _voms_proxy_init_cmd() has set them.
+        voms_args = r" \$REANA_VOMS_PROXY_BIND \$REANA_VOMS_PROXY_ENV" if self._has_voms_secrets() else ""
         return (
             "singularity exec -B {SLURM_WORKSAPCE}:{REANA_WORKSPACE}"
             "{SECRETS_BIND}"
+            "{CVMFS_BIND}"
             "{VOMS_ARGS}"
             " {IMAGE} {CMD}".format(
-                SLURM_WORKSAPCE=SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
-                REANA_WORKSPACE=SlurmJobManagerCERN.REANA_WORKSPACE_PATH,
+                SLURM_WORKSAPCE=self.slurm_workspace_path,
+                REANA_WORKSPACE=self.reana_workspace_path,
                 SECRETS_BIND=self._secrets_bind_mount(),
+                CVMFS_BIND=self._cvmfs_bind_mounts(),
                 VOMS_ARGS=voms_args,
                 IMAGE=self._get_container(),
                 CMD="./" + self.job_file,
             )
         )
 
-    def get_outputs():
-        """Transfer job outputs to REANA."""
-        os.chdir(SlurmJobManagerCERN.REANA_WORKSPACE_PATH)
-        slurm_connection = SSHClient()
-        sftp = slurm_connection.ssh_client.open_sftp()
-        SlurmJobManagerCERN._download_dir(
-            sftp,
-            SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH,
-            SlurmJobManagerCERN.REANA_WORKSPACE_PATH,
-        )
-        sftp.close()
+    @classmethod
+    def get_outputs(cls):
+        """Transfer job outputs to REANA.
+
+        No-op: outputs remain on the Slurm head node and are read
+        via SSH when needed (see get_logs).
+        """
+        pass
 
     def _download_dir(sftp, remote_dir, local_dir):
         """Download remote directory content."""
@@ -378,7 +416,7 @@ class SlurmJobManagerCERN(JobManager):
 
     @classmethod
     def get_logs(cls, backend_job_id, **kwargs):
-        """Return job logs if log files are present.
+        """Return job logs by reading them from the Slurm head node via SSH.
 
         :param backend_job_id: ID of the job in the backend.
         :param kwargs: Additional parameters needed to fetch logs.
@@ -389,20 +427,53 @@ class SlurmJobManagerCERN(JobManager):
             raise ValueError("Missing 'workspace' parameter")
         workspace = kwargs["workspace"]
 
-        stderr_file = os.path.join(
-            workspace, "reana_job." + str(backend_job_id) + ".err"
-        )
-        stdout_file = os.path.join(
-            workspace, "reana_job." + str(backend_job_id) + ".out"
-        )
-        log_files = [stderr_file, stdout_file]
-        job_log = ""
         try:
-            for file in log_files:
-                with open(file, "r") as log_file:
-                    job_log += log_file.read()
+            slurm_connection = SSHClient(
+                hostname=SLURM_HEADNODE_HOSTNAME,
+                port=SLURM_HEADNODE_PORT,
+                timeout=SLURM_SSH_TIMEOUT,
+                banner_timeout=SLURM_SSH_BANNER_TIMEOUT,
+                auth_timeout=SLURM_SSH_AUTH_TIMEOUT,
+            )
+            slurm_home = cls.SLURM_HOME_PATH or slurm_connection.exec_command("pwd").rstrip()
+            slurm_workspace = os.path.join(slurm_home, workspace.lstrip("/"))
+            stderr_file = os.path.join(
+                slurm_workspace, "reana_job." + str(backend_job_id) + ".err"
+            )
+            stdout_file = os.path.join(
+                slurm_workspace, "reana_job." + str(backend_job_id) + ".out"
+            )
+            job_log = ""
+            for log_file in [stderr_file, stdout_file]:
+                job_log += slurm_connection.exec_command(
+                    "cat {}".format(log_file)
+                )
             return job_log
         except Exception as e:
             msg = "Job logs of {} were not found. {}".format(backend_job_id, e)
             logging.error(msg, exc_info=True)
             return msg
+
+    def stop(backend_job_id):
+        """Stop Slurm job execution by running scancel via SSH.
+
+        :param backend_job_id: Slurm job ID to cancel.
+        """
+        try:
+            slurm_connection = SSHClient(
+                hostname=SLURM_HEADNODE_HOSTNAME,
+                port=SLURM_HEADNODE_PORT,
+                timeout=SLURM_SSH_TIMEOUT,
+                banner_timeout=SLURM_SSH_BANNER_TIMEOUT,
+                auth_timeout=SLURM_SSH_AUTH_TIMEOUT,
+            )
+            output = slurm_connection.exec_command("scancel {}".format(backend_job_id))
+            if output:
+                logging.debug(
+                    "scancel output for job {}: {}".format(backend_job_id, output)
+                )
+        except Exception as e:
+            logging.error(
+                "Failed to stop Slurm job {}: {}".format(backend_job_id, e),
+                exc_info=True,
+            )

@@ -19,6 +19,7 @@ def _make_manager(docker_img):
         mgr.docker_img = docker_img
         mgr.img_type_docker = mgr._is_img_type_docker()
         mgr.slurm_connection = MagicMock()
+        mgr.cvmfs_mounts = "false"
         SlurmJobManagerCERN.SLURM_WORKSAPCE_PATH = "/remote/workspace"
         return mgr
 
@@ -357,11 +358,15 @@ class TestVomsProxy:
         assert "voms_proxy.pem" not in bind
 
     def test_voms_proxy_shell_vars_in_singularity_cmd(self):
-        """Singularity cmd uses shell variables for proxy bind/env, not literal paths."""
+        """Singularity cmd uses escaped shell variables for proxy bind/env.
+
+        The variables must be written as \\$ so they survive the double-quoted
+        bash assignment used to write job_description.sh on the remote host.
+        """
         mgr = _make_manager_with_secrets("docker.io/org/img:v1", _make_voms_secrets())
         cmd = mgr._wrap_singularity_cmd()
-        assert "$REANA_VOMS_PROXY_BIND" in cmd
-        assert "$REANA_VOMS_PROXY_ENV" in cmd
+        assert r"\$REANA_VOMS_PROXY_BIND" in cmd
+        assert r"\$REANA_VOMS_PROXY_ENV" in cmd
 
     def test_voms_proxy_shell_vars_absent_without_voms_secrets(self):
         """Shell variable placeholders not added when voms secrets are absent."""
@@ -370,8 +375,8 @@ class TestVomsProxy:
             _make_user_secrets(env_secrets={"OTHER_VAR": "val"}),
         )
         cmd = mgr._wrap_singularity_cmd()
-        assert "$REANA_VOMS_PROXY_BIND" not in cmd
-        assert "$REANA_VOMS_PROXY_ENV" not in cmd
+        assert r"\$REANA_VOMS_PROXY_BIND" not in cmd
+        assert r"\$REANA_VOMS_PROXY_ENV" not in cmd
 
     def test_voms_proxy_init_cmd_sets_shell_vars_conditionally(self):
         """_voms_proxy_init_cmd sets shell vars only if proxy file was created."""
@@ -431,3 +436,24 @@ class TestNativeExecution:
         result = mgr._wrap_singularity_cmd()
         assert result == "./job.sh"
         assert "singularity" not in result
+
+
+class TestStop:
+    """Tests for SlurmJobManagerCERN.stop()."""
+
+    def test_stop_calls_scancel_with_job_id(self):
+        """stop() SSHs to head node and runs scancel <backend_job_id>."""
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient") as mock_ssh_cls:
+            mock_conn = MagicMock()
+            mock_ssh_cls.return_value = mock_conn
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            SlurmJobManagerCERN.stop("12345")
+            mock_conn.exec_command.assert_called_once_with("scancel 12345")
+
+    def test_stop_logs_error_on_ssh_failure(self):
+        """stop() logs but does not raise when SSH connection fails."""
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient") as mock_ssh_cls:
+            mock_ssh_cls.side_effect = Exception("Connection refused")
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            # Should not raise
+            SlurmJobManagerCERN.stop("12345")
