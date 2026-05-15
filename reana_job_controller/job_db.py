@@ -125,7 +125,8 @@ def store_job_logs(job_id, logs):
     logging.info(f"Storing job logs: {job_id}")
     JOB_DB[job_id]["log"] = logs
     try:
-        Session.query(Job).filter_by(id_=job_id).update(dict(logs=logs))
+        sanitized_logs = logs.replace("\x00", "") if logs else logs
+        Session.query(Job).filter_by(id_=job_id).update(dict(logs=sanitized_logs))
         Session.commit()
     except Exception as e:
         logging.exception(f"Exception while saving logs: {e}")

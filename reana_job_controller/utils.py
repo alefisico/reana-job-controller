@@ -281,12 +281,17 @@ class SSHClient:
                 auth_strategy=self.auth_strategy,
             )
 
-    def exec_command(self, command):
+    def exec_command(self, command, timeout=120):
         """Execute command and return exit code."""
         if not self.ssh_client.get_transport().active:
             self.establish_connection()
         try:
-            stdin, stdout, stderr = self.ssh_client.exec_command(command)
+            stdin, stdout, stderr = self.ssh_client.exec_command(
+                command, timeout=timeout
+            )
+            # settimeout ensures recv_exit_status() doesn't block forever;
+            # paramiko's per-read timeout doesn't cover the exit-status wait.
+            stdout.channel.settimeout(timeout)
             if stdout.channel.recv_exit_status() != 0:
                 raise Exception(stderr.read().decode("utf-8"))
             return stdout.read().decode("utf-8")
@@ -295,3 +300,8 @@ class SSHClient:
                 "Exception while executing cmd: {} \n{}".format(command, str(e)),
                 exc_info=True,
             )
+            try:
+                self.establish_connection()
+            except Exception:
+                pass
+            raise

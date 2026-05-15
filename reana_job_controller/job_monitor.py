@@ -472,34 +472,72 @@ class JobMonitorSlurmCERN(JobMonitor):
                     ):
                         slurm_jobs[job_dict["backend_job_id"]] = id
                 if not slurm_jobs.keys():
+                    time.sleep(30)
                     continue
 
                 for slurm_job_id, job_dict in slurm_jobs.items():
+                    all_statuses = list(slurmJobStatus["finished"]) + list(slurmJobStatus["failed"]) + list(slurmJobStatus["running"]) + list(slurmJobStatus["idle"])
                     slurm_job_status = slurm_connection.exec_command(
                         f"scontrol show job {slurm_job_id} -o | tr ' ' '\n' | grep JobState | cut -f2 -d '='"
                     ).rstrip()
+                    if slurm_job_status not in all_statuses:
+                        # scontrol only shows active/recent jobs; fall back to sacct for completed ones
+                        slurm_job_status = slurm_connection.exec_command(
+                            f"sacct -j {slurm_job_id} -o State -n -X | tr -d ' '"
+                        ).rstrip()
                     job_id = slurm_jobs[slurm_job_id]
                     if slurm_job_status in slurmJobStatus["finished"]:
-                        self.job_manager_cls.get_outputs()
+                        self.job_manager_cls.get_outputs(
+                            workspace=job_db[job_id]["obj"].workflow_workspace,
+                        )
                         update_job_status(job_id, "finished")
                         job_db[job_id]["deleted"] = True
-                        logs = self.job_manager_cls.get_logs(
-                            backend_job_id=slurm_job_id,
+                        workspace = job_db[job_id]["obj"].workflow_workspace
+                        threading.Thread(
+                            target=self._fetch_and_store_logs,
+                            args=(slurm_job_id, job_id, workspace),
+                            daemon=True,
+                        ).start()
+                    elif slurm_job_status in slurmJobStatus["failed"]:
+                        self.job_manager_cls.get_outputs(
                             workspace=job_db[job_id]["obj"].workflow_workspace,
                         )
-                        store_job_logs(job_id, logs)
-                    if slurm_job_status in slurmJobStatus["failed"]:
-                        self.job_manager_cls.get_outputs()
                         update_job_status(job_id, "failed")
                         job_db[job_id]["deleted"] = True
-                        logs = self.job_manager_cls.get_logs(
-                            backend_job_id=slurm_job_id,
-                            workspace=job_db[job_id]["obj"].workflow_workspace,
-                        )
-                        store_job_logs(job_id, logs)
+                        workspace = job_db[job_id]["obj"].workflow_workspace
+                        threading.Thread(
+                            target=self._fetch_and_store_logs,
+                            args=(slurm_job_id, job_id, workspace),
+                            daemon=True,
+                        ).start()
+                    elif slurm_job_status in slurmJobStatus["running"]:
+                        try:
+                            logs = self.job_manager_cls.get_logs(
+                                backend_job_id=slurm_job_id,
+                                workspace=job_db[job_id]["obj"].workflow_workspace,
+                            )
+                            store_job_logs(job_id, logs)
+                        except Exception as e:
+                            logging.warning(
+                                f"Could not fetch intermediate logs for job "
+                                f"{slurm_job_id}: {e}"
+                            )
             except Exception as e:
                 logging.error("Unexpected error: {}".format(e), exc_info=True)
-                time.sleep(120)
+            time.sleep(30)
+
+    def _fetch_and_store_logs(self, slurm_job_id, job_id, workspace):
+        """Fetch logs from Slurm and store them. Runs in a background thread."""
+        try:
+            logs = self.job_manager_cls.get_logs(
+                backend_job_id=slurm_job_id,
+                workspace=workspace,
+            )
+            store_job_logs(job_id, logs)
+        except Exception as e:
+            logging.error(
+                f"Could not fetch logs for job {slurm_job_id}: {e}", exc_info=True
+            )
 
 
 @singleton

@@ -210,6 +210,9 @@ SLURM_HEADNODE_PORT = os.getenv("SLURM_CLUSTER_PORT", "22")
 SLURM_PARTITION = os.getenv("SLURM_PARTITION", "inf-short")
 """Default slurm partition."""
 
+SLURM_QOS = os.getenv("SLURM_QOS", "")
+"""Default Slurm QOS (queue). Empty string means no --qos directive."""
+
 SLURM_JOB_TIMELIMIT = os.getenv("SLURM_JOB_TIMELIMIT", "60")
 """Default SLURM job timelimit.
 

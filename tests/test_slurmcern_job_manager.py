@@ -438,6 +438,207 @@ class TestNativeExecution:
         assert "singularity" not in result
 
 
+class TestGetOutputs:
+    """Tests for SlurmJobManagerCERN.get_outputs()."""
+
+    def test_no_workspace_returns_immediately(self):
+        """get_outputs() with no workspace arg is a no-op (no SSH connection made)."""
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient") as mock_ssh_cls:
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            SlurmJobManagerCERN.get_outputs()
+            mock_ssh_cls.assert_not_called()
+
+    def test_shared_filesystem_skips_transfer(self, tmp_path):
+        """When slurm_workspace resolves to the same path as workspace, no SFTP transfer."""
+        workspace = str(tmp_path / "workspace")
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient") as mock_ssh_cls:
+            mock_conn = MagicMock()
+            mock_ssh_cls.return_value = mock_conn
+            mock_conn.exec_command.return_value = ""  # pwd returns empty → home=""
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            # Set SLURM_HOME_PATH so slurm_workspace == workspace
+            original = SlurmJobManagerCERN.SLURM_HOME_PATH
+            try:
+                SlurmJobManagerCERN.SLURM_HOME_PATH = "/"
+                SlurmJobManagerCERN.get_outputs(workspace=workspace)
+                # SFTP should not be opened
+                mock_conn.ssh_client.open_sftp.assert_not_called()
+            finally:
+                SlurmJobManagerCERN.SLURM_HOME_PATH = original
+
+    def test_download_called_when_paths_differ(self, tmp_path):
+        """When slurm and local workspaces differ, _download_dir is called via SFTP."""
+        workspace = str(tmp_path / "local_workspace")
+        slurm_home = "/home/export/reana-CMU"
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient") as mock_ssh_cls:
+            mock_conn = MagicMock()
+            mock_ssh_cls.return_value = mock_conn
+            mock_sftp = MagicMock()
+            mock_conn.ssh_client.open_sftp.return_value = mock_sftp
+            # listdir_attr returns empty list → no files to download
+            mock_sftp.listdir_attr.return_value = []
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            original = SlurmJobManagerCERN.SLURM_HOME_PATH
+            try:
+                SlurmJobManagerCERN.SLURM_HOME_PATH = slurm_home
+                SlurmJobManagerCERN.get_outputs(workspace=workspace)
+                mock_conn.ssh_client.open_sftp.assert_called_once()
+                mock_sftp.close.assert_called_once()
+                # The remote dir passed to listdir_attr should be the slurm workspace
+                expected_remote = slurm_home + workspace
+                mock_sftp.listdir_attr.assert_called_once_with(expected_remote)
+            finally:
+                SlurmJobManagerCERN.SLURM_HOME_PATH = original
+
+    def test_ssh_failure_is_logged_not_raised(self):
+        """get_outputs() logs errors but does not propagate exceptions."""
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient") as mock_ssh_cls:
+            mock_ssh_cls.side_effect = Exception("Connection refused")
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            # Should not raise
+            SlurmJobManagerCERN.get_outputs(workspace="/opt/reana/users/x/workflows/y")
+
+
+class TestTransferInputsUploadOnce:
+    """Tests for the upload-once sentinel + lock behaviour in _transfer_inputs."""
+
+    def _make_transfer_manager(self, workspace):
+        """Manager wired for _transfer_inputs tests."""
+        with patch("reana_job_controller.slurmcern_job_manager.SSHClient"):
+            from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+            import threading
+            mgr = SlurmJobManagerCERN.__new__(SlurmJobManagerCERN)
+            mgr.docker_img = "/cvmfs/unpacked.cern.ch/image:latest"
+            mgr.img_type_docker = False
+            mgr.slurm_connection = MagicMock()
+            mgr.workflow_workspace = workspace
+            mgr.secrets = None
+            mgr.slurm_workspace_path = "/remote" + workspace
+            mgr.slurm_home_path = "/remote"
+            mgr.reana_workspace_path = workspace
+            # Reset class-level state between tests
+            SlurmJobManagerCERN._upload_locks = {}
+            return mgr
+
+    def test_sentinel_written_after_successful_upload(self, tmp_path):
+        """After _do_transfer_inputs completes, sentinel file is written to remote."""
+        from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+        workspace = str(tmp_path)
+        mgr = self._make_transfer_manager(workspace)
+
+        # exec_command: pwd, mkdir, sentinel check → absent (None), sentinel write
+        mgr.slurm_connection.exec_command.side_effect = [
+            "/remote",  # pwd
+            "",         # mkdir
+            None,       # test -f sentinel → absent
+            "",         # touch sentinel
+        ]
+        sftp = MagicMock()
+        sftp.listdir_attr.return_value = []
+        mgr.slurm_connection.ssh_client.open_sftp.return_value = sftp
+
+        mgr._do_transfer_inputs()
+
+        # The last exec_command call must write the sentinel
+        last_cmd = mgr.slurm_connection.exec_command.call_args_list[-1][0][0]
+        assert ".reana_upload_complete" in last_cmd
+
+    def test_upload_skipped_when_sentinel_exists(self, tmp_path):
+        """When sentinel already exists on remote, SFTP put is never called."""
+        from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+        workspace = str(tmp_path)
+        # Put a real file in the workspace so os.walk would find it
+        (tmp_path / "processor_HH4b.py").write_text("class analysis: pass")
+        mgr = self._make_transfer_manager(workspace)
+
+        # exec_command: pwd, mkdir, sentinel check → present ("")
+        mgr.slurm_connection.exec_command.side_effect = [
+            "/remote",  # pwd
+            "",         # mkdir
+            "",         # test -f sentinel → present (non-None = file exists)
+        ]
+        sftp = MagicMock()
+        mgr.slurm_connection.ssh_client.open_sftp.return_value = sftp
+
+        mgr._do_transfer_inputs()
+
+        sftp.put.assert_not_called()
+
+    def test_concurrent_jobs_only_upload_once(self, tmp_path):
+        """With two threads calling _transfer_inputs, SFTP put runs only once.
+
+        Both managers share the same workspace. The first thread does the full
+        upload and writes the sentinel. The second thread, after waiting for the
+        lock, finds the sentinel and skips the SFTP put.
+        """
+        import threading
+        from reana_job_controller.slurmcern_job_manager import SlurmJobManagerCERN
+
+        workspace = str(tmp_path)
+        # Put a real file so os.walk finds something to upload
+        (tmp_path / "processor.py").write_text("class analysis: pass")
+
+        SlurmJobManagerCERN._upload_locks = {}
+
+        sftp_put_count = [0]
+
+        def make_mgr():
+            mgr = self._make_transfer_manager(workspace)
+            real_sftp = MagicMock()
+
+            def counting_put(local, remote):
+                sftp_put_count[0] += 1
+
+            real_sftp.put.side_effect = counting_put
+            real_sftp.listdir_attr.return_value = []
+
+            sentinel_state = [None]  # None = absent, "" = present
+
+            def exec_side_effect(cmd, **kwargs):
+                if "test -f" in cmd and SlurmJobManagerCERN.SENTINEL_FILENAME in cmd:
+                    return sentinel_state[0]
+                if "touch" in cmd and SlurmJobManagerCERN.SENTINEL_FILENAME in cmd:
+                    sentinel_state[0] = ""  # sentinel now exists
+                    return ""
+                return ""  # pwd, mkdir, etc.
+
+            mgr.slurm_connection.exec_command.side_effect = exec_side_effect
+            mgr.slurm_connection.ssh_client.open_sftp.return_value = real_sftp
+            return mgr, sentinel_state
+
+        mgr1, sentinel_state = make_mgr()
+        mgr2, _ = make_mgr()
+        # Share the same sentinel state between both managers
+        def exec_side_effect_shared(cmd, **kwargs):
+            if "test -f" in cmd and SlurmJobManagerCERN.SENTINEL_FILENAME in cmd:
+                return sentinel_state[0]
+            if "touch" in cmd and SlurmJobManagerCERN.SENTINEL_FILENAME in cmd:
+                sentinel_state[0] = ""
+                return ""
+            return ""
+        mgr2.slurm_connection.exec_command.side_effect = exec_side_effect_shared
+
+        results = []
+        errors = []
+
+        def run(mgr):
+            try:
+                mgr._transfer_inputs()
+                results.append("ok")
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=run, args=(mgr1,))
+        t2 = threading.Thread(target=run, args=(mgr2,))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert not errors, errors
+        assert len(results) == 2
+        # SFTP put should have been called exactly once (one file, one upload)
+        assert sftp_put_count[0] == 1
+
+
 class TestStop:
     """Tests for SlurmJobManagerCERN.stop()."""
 

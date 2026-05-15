@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import uuid
 from stat import S_ISDIR
 
@@ -22,6 +23,7 @@ from reana_job_controller.config import (
     SLURM_HEADNODE_HOSTNAME,
     SLURM_HEADNODE_PORT,
     SLURM_PARTITION,
+    SLURM_QOS,
     SLURM_JOB_TIMELIMIT,
     SLURM_SSH_TIMEOUT,
     SLURM_SSH_BANNER_TIMEOUT,
@@ -34,6 +36,9 @@ class SlurmJobManagerCERN(JobManager):
 
     SLURM_HOME_PATH = os.getenv("SLURM_HOME_PATH", "")
     """Default SLURM home path."""
+    _upload_locks = {}
+    _upload_locks_mutex = threading.Lock()
+    SENTINEL_FILENAME = ".reana_upload_complete"
 
     def __init__(
         self,
@@ -47,7 +52,13 @@ class SlurmJobManagerCERN(JobManager):
         shared_file_system=False,
         job_name=None,
         slurm_partition=SLURM_PARTITION,
+        slurm_qos=SLURM_QOS,
         slurm_job_timelimit=SLURM_JOB_TIMELIMIT,
+        slurm_cpus=None,
+        slurm_mem=None,
+        slurm_nodes=None,
+        slurm_ntasks=None,
+        slurm_gres=None,
         secrets: UserSecrets = None,
         **kwargs,
     ):
@@ -91,7 +102,13 @@ class SlurmJobManagerCERN(JobManager):
         self.cvmfs_mounts = cvmfs_mounts
         self.shared_file_system = shared_file_system
         self.partition = slurm_partition
+        self.qos = slurm_qos
         self.timelimit = slurm_job_timelimit
+        self.cpus = slurm_cpus
+        self.mem = slurm_mem
+        self.nodes = slurm_nodes
+        self.ntasks = slurm_ntasks
+        self.gres = slurm_gres
         self.secrets = secrets
         self.img_type_docker = self._is_img_type_docker()
         self.slurm_workspace_path = ""
@@ -104,7 +121,41 @@ class SlurmJobManagerCERN(JobManager):
         self.job_description_file = "job_description_{}.sh".format(job_suffix)
 
     def _transfer_inputs(self):
-        """Transfer inputs to SLURM submit node."""
+        """Transfer inputs to SLURM submit node.
+
+        Uses a per-workspace lock so that only one thread uploads when multiple
+        jobs from the same workflow are submitted concurrently. The first thread
+        to acquire the lock performs the full upload; subsequent threads skip
+        the upload because the sentinel written by the first thread tells them
+        the workspace is already complete.
+        """
+        workspace_key = self.workflow_workspace
+        with SlurmJobManagerCERN._upload_locks_mutex:
+            if workspace_key not in SlurmJobManagerCERN._upload_locks:
+                SlurmJobManagerCERN._upload_locks[workspace_key] = threading.Lock()
+        lock = SlurmJobManagerCERN._upload_locks[workspace_key]
+
+        with lock:
+            for attempt in range(2):
+                try:
+                    self._do_transfer_inputs()
+                    return
+                except Exception as e:
+                    if attempt == 0:
+                        logging.warning(
+                            "Input transfer failed ({}), reconnecting and retrying.".format(e)
+                        )
+                        self.slurm_connection.establish_connection()
+                    else:
+                        raise
+
+    def _do_transfer_inputs(self):
+        """Perform the actual SFTP transfer of inputs to the SLURM submit node.
+
+        Skips the upload entirely when a sentinel file already exists on the
+        remote workspace, meaning a previous job from this workflow already
+        transferred the inputs. Writes the sentinel after a successful upload.
+        """
         stdout = self.slurm_connection.exec_command("pwd")
         self.slurm_home_path = SlurmJobManagerCERN.SLURM_HOME_PATH or stdout.rstrip()
         self.slurm_workspace_path = os.path.join(
@@ -114,7 +165,20 @@ class SlurmJobManagerCERN(JobManager):
         self.slurm_connection.exec_command(
             "mkdir -p {}".format(self.slurm_workspace_path)
         )
+        sentinel_path = os.path.join(
+            self.slurm_workspace_path, SlurmJobManagerCERN.SENTINEL_FILENAME
+        )
+        try:
+            self.slurm_connection.exec_command('test -f "{}"'.format(sentinel_path))
+            logging.info(
+                "Input upload sentinel found — skipping transfer for workspace %s",
+                self.slurm_workspace_path,
+            )
+            return
+        except Exception:
+            pass  # sentinel absent (exit 1 = file not found), proceed with upload
         sftp = self.slurm_connection.ssh_client.open_sftp()
+        sftp.get_channel().settimeout(600)
         os.chdir(self.workflow_workspace)
         for dirpath, dirnames, filenames in os.walk(self.workflow_workspace):
             try:
@@ -130,6 +194,9 @@ class SlurmJobManagerCERN(JobManager):
                 sftp.put(os.path.join(dirpath, file), remote_path)
         self._transfer_secrets(sftp)
         sftp.close()
+        self.slurm_connection.exec_command(
+            'touch "{}"'.format(sentinel_path)
+        )
 
     def _transfer_secrets(self, sftp):
         """Transfer file-type user secrets to Slurm head node."""
@@ -288,44 +355,95 @@ class SlurmJobManagerCERN(JobManager):
     def _dump_job_submission_file(self):
         """Dump job submission file to the Slurm submit node."""
         safe_job_name = re.sub(r"[^\w\-.]", "_", self.job_name)
+        qos_line = "#SBATCH --qos {qos} \n".format(qos=self.qos) if self.qos else ""
+        cpus_line = "#SBATCH --cpus-per-task {cpus} \n".format(cpus=self.cpus) if self.cpus else ""
+        mem_line = "#SBATCH --mem {mem}M \n".format(mem=self.mem) if self.mem else ""
+        nodes_line = "#SBATCH --nodes {nodes} \n".format(nodes=self.nodes) if self.nodes else ""
+        ntasks_line = "#SBATCH --ntasks {ntasks} \n".format(ntasks=self.ntasks) if self.ntasks else ""
+        gres_line = "#SBATCH --gres {gres} \n".format(gres=self.gres) if self.gres else ""
         job_template = (
             "#!/bin/bash \n"
             "#SBATCH --job-name={job_name} \n"
             "#SBATCH --output=reana_job.%j.out \n"
             "#SBATCH --error=reana_job.%j.err \n"
             "#SBATCH --partition {partition} \n"
+            "{qos_line}"
             "#SBATCH --time {time} \n"
+            "{cpus_line}"
+            "{mem_line}"
+            "{nodes_line}"
+            "{ntasks_line}"
+            "{gres_line}"
             "export PATH=$PATH:/usr/sbin \n"
             "{env_secrets}"
             "{voms_proxy_init}"
+            "{cvmfs_premount}"
             "srun {command}"
         ).format(
             partition=self.partition,
+            qos_line=qos_line,
             time=self.timelimit,
+            cpus_line=cpus_line,
+            mem_line=mem_line,
+            nodes_line=nodes_line,
+            ntasks_line=ntasks_line,
+            gres_line=gres_line,
             job_name=safe_job_name,
             env_secrets=self._env_secrets_exports(),
             voms_proxy_init=self._voms_proxy_init_cmd(),
+            cvmfs_premount=self._cvmfs_premount_cmd(),
             command=self._wrap_singularity_cmd(),
         )
-        self.slurm_connection.exec_command(
-            'cd {} && job="{}" && echo "$job"> {}'.format(
-                self.slurm_workspace_path,
-                job_template,
-                self.job_description_file,
-            )
-        )
+        desc_path = os.path.join(self.slurm_workspace_path, self.job_description_file)
+        sftp = self.slurm_connection.ssh_client.open_sftp()
+        try:
+            with sftp.open(desc_path, "w") as f:
+                f.write(job_template)
+        finally:
+            sftp.close()
 
     def _dump_job_file(self):
         """Dump job file."""
-        job_template = "#!/bin/bash \n{}".format(self.cmd)
-        self.slurm_connection.exec_command(
-            'cd {} && job="{}" && echo "$job" > {} && chmod +x {}'.format(
-                self.slurm_workspace_path,
-                job_template,
-                self.job_file,
-                self.job_file,
+        cmd = self.cmd
+        if not self.docker_img and self.slurm_workspace_path:
+            # Without a container there is no bind-mount to remap the REANA
+            # workspace path onto the Slurm node.  Decode, replace the cd, and
+            # re-encode so bare jobs land in the NFS-accessible path on any
+            # worker node (e.g. rogue01 which has no /opt/reana/users).
+            import base64 as _b64
+            decoded = _b64.b64decode(
+                cmd.removeprefix("echo ").removesuffix("|base64 -d|bash")
+            ).decode("utf-8")
+            decoded = decoded.replace(
+                "cd {}".format(self.workflow_workspace),
+                "cd {}".format(self.slurm_workspace_path),
+                1,
             )
-        )
+            encoded = _b64.b64encode(decoded.encode("utf-8")).decode("utf-8")
+            cmd = "echo {}|base64 -d|bash".format(encoded)
+        job_content = "#!/bin/bash \n{}".format(cmd)
+        job_path = os.path.join(self.slurm_workspace_path, self.job_file)
+        # Write via SFTP to avoid shell quoting issues with long base64 strings.
+        sftp = self.slurm_connection.ssh_client.open_sftp()
+        try:
+            with sftp.open(job_path, "w") as f:
+                f.write(job_content)
+            sftp.chmod(job_path, 0o755)
+        finally:
+            sftp.close()
+        # Verify the file was actually written before submitting.
+        # NFS attribute cache on falcon can delay visibility of a just-written file
+        # for up to ~60 s; retry a few times before declaring failure.
+        import time as _time
+        for _attempt in range(6):
+            result = self.slurm_connection.exec_command('test -f "{}"'.format(job_path))
+            if result is not None:
+                break
+            _time.sleep(10)
+        else:
+            raise RuntimeError(
+                "job file {} was not created on the Slurm head node".format(job_path)
+            )
 
     def _encode_cmd(self, cmd):
         """Encode base64 cmd."""
@@ -363,6 +481,32 @@ class SlurmJobManagerCERN(JobManager):
         except (ValueError, SyntaxError):
             return " -B /cvmfs"
 
+    def _cvmfs_premount_cmd(self):
+        """Return a shell line that triggers autofs to mount CVMFS repos before Singularity snapshots /cvmfs.
+
+        Singularity bind-mounts /cvmfs at exec time; repos not yet mounted by
+        autofs at that moment are invisible inside the container.  Accessing
+        each repo path forces autofs to mount it first.
+        """
+        if not self.cvmfs_mounts or self.cvmfs_mounts == "false":
+            return ""
+        import ast
+        try:
+            repos = ast.literal_eval(self.cvmfs_mounts)
+            # Known repo list: touch each path directly.
+            paths = " ".join("/cvmfs/{}".format(r) for r in repos)
+            return "ls {} > /dev/null 2>&1 || true\n".format(paths)
+        except (ValueError, SyntaxError):
+            # cvmfs_mounts is "true" or unparseable — read CVMFS_REPOSITORIES from
+            # the node's config and touch each repo so autofs mounts them before
+            # Singularity snapshots /cvmfs.  "ls /cvmfs" alone only lists the
+            # autofs root and does not trigger lazy mounts of individual repos.
+            return (
+                "for _r in $(grep CVMFS_REPOSITORIES /etc/cvmfs/default.local"
+                " | cut -d= -f2 | tr ',' ' '); do"
+                " ls /cvmfs/$_r > /dev/null 2>&1; done || true\n"
+            )
+
     def _wrap_singularity_cmd(self):
         """Wrap command in Singularity, or run natively if no container image.
 
@@ -372,11 +516,7 @@ class SlurmJobManagerCERN(JobManager):
         """
         if not self.docker_img:
             return "./" + self.job_file
-        # Use \$ so the dollar signs survive the double-quoted bash assignment used
-        # to write job_description.sh (exec_command wraps the script in job="...").
-        # Bash interprets \$ as a literal $ in double-quoted strings, so these
-        # expand correctly at job-run time after _voms_proxy_init_cmd() has set them.
-        voms_args = r" \$REANA_VOMS_PROXY_BIND \$REANA_VOMS_PROXY_ENV" if self._has_voms_secrets() else ""
+        voms_args = " $REANA_VOMS_PROXY_BIND $REANA_VOMS_PROXY_ENV" if self._has_voms_secrets() else ""
         return (
             "singularity exec -B {SLURM_WORKSAPCE}:{REANA_WORKSPACE}"
             "{SECRETS_BIND}"
@@ -394,16 +534,54 @@ class SlurmJobManagerCERN(JobManager):
         )
 
     @classmethod
-    def get_outputs(cls):
-        """Transfer job outputs to REANA.
+    def get_outputs(cls, workspace=None, **kwargs):
+        """Transfer job outputs from the Slurm head node back to the REANA workspace.
 
-        No-op: outputs remain on the Slurm head node and are read
-        via SSH when needed (see get_logs).
+        When SLURM_HOME_PATH differs from the REANA workspace root (i.e. the Slurm
+        head node does not share a filesystem with the K8s control plane), output
+        files written by the job must be copied back via SFTP so that the Snakemake
+        engine can see them.  If the two roots are the same filesystem this is a
+        no-op because the files are already in place.
+
+        :param workspace: Absolute path to the REANA workflow workspace on the
+            control-plane node (e.g. ``/opt/reana/users/<uid>/workflows/<wid>``).
+        :type workspace: str
         """
-        pass
+        if not workspace:
+            return
+        try:
+            slurm_connection = SSHClient(
+                hostname=SLURM_HEADNODE_HOSTNAME,
+                port=SLURM_HEADNODE_PORT,
+                timeout=SLURM_SSH_TIMEOUT,
+                banner_timeout=SLURM_SSH_BANNER_TIMEOUT,
+                auth_timeout=SLURM_SSH_AUTH_TIMEOUT,
+            )
+            slurm_home = (
+                cls.SLURM_HOME_PATH
+                or slurm_connection.exec_command("pwd").rstrip()
+            )
+            slurm_workspace = os.path.join(slurm_home, workspace.lstrip("/"))
+            # Skip transfer when the Slurm workspace IS the REANA workspace
+            # (i.e. shared filesystem — same path resolves on both sides).
+            if os.path.realpath(slurm_workspace) == os.path.realpath(workspace):
+                return
+            sftp = slurm_connection.ssh_client.open_sftp()
+            sftp.get_channel().settimeout(600)
+            SlurmJobManagerCERN._download_dir(sftp, slurm_workspace, workspace)
+            sftp.close()
+            logging.info(
+                "Transferred outputs from %s to %s", slurm_workspace, workspace
+            )
+        except Exception as e:
+            logging.error(
+                "Failed to transfer outputs from Slurm workspace: %s", e,
+                exc_info=True,
+            )
 
+    @staticmethod
     def _download_dir(sftp, remote_dir, local_dir):
-        """Download remote directory content."""
+        """Recursively download a remote directory via SFTP."""
         os.path.exists(local_dir) or os.makedirs(local_dir)
         dir_items = sftp.listdir_attr(remote_dir)
         for item in dir_items:

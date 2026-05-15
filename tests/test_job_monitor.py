@@ -166,3 +166,105 @@ def test_log_disruption_evicted(conditions, is_call_expected, expected_message):
             log_mock.assert_called_with(expected_message)
         else:
             log_mock.assert_not_called()
+
+
+def test_slurm_monitor_fetches_logs_for_running_jobs(app, mocked_job_managers):
+    """Test that the Slurm monitor fetches intermediate logs for running jobs."""
+    with mock.patch("reana_job_controller.job_monitor.threading"):
+        job_monitor = JobMonitorSlurmCERN(app=app)
+
+    mock_ssh = mock.MagicMock()
+    mock_ssh.exec_command.return_value = "RUNNING"
+
+    job_id = str(uuid.uuid4())
+    backend_job_id = "12345"
+    mock_job_obj = mock.MagicMock()
+    mock_job_obj.workflow_workspace = "/test/workspace"
+
+    job_db = {
+        job_id: {
+            "deleted": False,
+            "compute_backend": "slurmcern",
+            "status": "started",
+            "backend_job_id": backend_job_id,
+            "obj": mock_job_obj,
+        }
+    }
+
+    slurm_manager = mocked_job_managers["slurmcern"]()
+    slurm_manager.get_logs.return_value = "partial log output"
+
+    with (
+        mock.patch(
+            "reana_job_controller.job_monitor.SSHClient", return_value=mock_ssh
+        ),
+        mock.patch(
+            "reana_job_controller.job_monitor.store_job_logs"
+        ) as mock_store_logs,
+        mock.patch(
+            "reana_job_controller.job_monitor.update_job_status"
+        ) as mock_update_status,
+        mock.patch("reana_job_controller.job_monitor.time") as mock_time,
+    ):
+        mock_time.sleep.side_effect = [None, StopIteration]
+        try:
+            job_monitor.watch_jobs(job_db, app=app)
+        except StopIteration:
+            pass
+
+        slurm_manager.get_logs.assert_called_with(
+            backend_job_id=backend_job_id,
+            workspace="/test/workspace",
+        )
+        mock_store_logs.assert_called_with(job_id, "partial log output")
+        mock_update_status.assert_not_called()
+        assert job_db[job_id]["deleted"] is False
+
+
+def test_slurm_monitor_handles_finished_jobs(app, mocked_job_managers):
+    """Test that finished jobs are still handled correctly (regression check)."""
+    with mock.patch("reana_job_controller.job_monitor.threading"):
+        job_monitor = JobMonitorSlurmCERN(app=app)
+
+    mock_ssh = mock.MagicMock()
+    mock_ssh.exec_command.return_value = "COMPLETED"
+
+    job_id = str(uuid.uuid4())
+    backend_job_id = "12345"
+    mock_job_obj = mock.MagicMock()
+    mock_job_obj.workflow_workspace = "/test/workspace"
+
+    job_db = {
+        job_id: {
+            "deleted": False,
+            "compute_backend": "slurmcern",
+            "status": "started",
+            "backend_job_id": backend_job_id,
+            "obj": mock_job_obj,
+        }
+    }
+
+    slurm_manager = mocked_job_managers["slurmcern"]()
+    slurm_manager.get_logs.return_value = "final log output"
+
+    with (
+        mock.patch(
+            "reana_job_controller.job_monitor.SSHClient", return_value=mock_ssh
+        ),
+        mock.patch(
+            "reana_job_controller.job_monitor.store_job_logs"
+        ) as mock_store_logs,
+        mock.patch(
+            "reana_job_controller.job_monitor.update_job_status"
+        ) as mock_update_status,
+        mock.patch("reana_job_controller.job_monitor.time") as mock_time,
+    ):
+        mock_time.sleep.side_effect = [None, StopIteration]
+        try:
+            job_monitor.watch_jobs(job_db, app=app)
+        except StopIteration:
+            pass
+
+        mock_update_status.assert_called_with(job_id, "finished")
+        mock_store_logs.assert_called_with(job_id, "final log output")
+        assert job_db[job_id]["deleted"] is True

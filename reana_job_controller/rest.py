@@ -310,7 +310,8 @@ def create_job():  # noqa
         logging.error(msg, exc_info=True)
         return jsonify({"message": msg}), 500
     except Exception as e:
-        msg = f"Job submission failed. \n{e}"
+        import traceback as _tb
+        msg = f"Job submission failed. \n{e}\n{_tb.format_exc()}"
         logging.error(msg, exc_info=True)
         return jsonify({"message": msg}), 500
     finally:
